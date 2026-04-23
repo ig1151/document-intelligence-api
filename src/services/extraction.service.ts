@@ -1,11 +1,10 @@
-import Anthropic from '@anthropic-ai/sdk';
 import { v4 as uuidv4 } from 'uuid';
-import { config } from '../utils/config';
 import { logger } from '../utils/logger';
 import { extractText } from '../utils/parser';
 import type { ExtractRequest, ExtractResponse, DocumentType } from '../types/index';
 
-const client = new Anthropic({ apiKey: config.anthropic.apiKey });
+const OPENROUTER_API_URL = 'https://openrouter.ai/api/v1/chat/completions';
+const MODEL = 'anthropic/claude-sonnet-4-5';
 
 function buildPrompt(documentType: DocumentType, fields?: string[], language?: string): string {
   const langNote = language && language !== 'en' ? `Output all human-readable strings in language: ${language}.\n` : '';
@@ -89,6 +88,8 @@ export async function extractDocument(req: ExtractRequest): Promise<ExtractRespo
   const t0 = Date.now();
   const docType = req.document_type ?? 'auto';
   const language = req.language ?? 'en';
+  const apiKey = process.env.OPENROUTER_API_KEY;
+  if (!apiKey) throw new Error('OPENROUTER_API_KEY not set');
 
   logger.info({ id, docType }, 'Starting document extraction');
 
@@ -121,13 +122,28 @@ export async function extractDocument(req: ExtractRequest): Promise<ExtractRespo
   const prompt = buildPrompt(detectedType, req.fields, language);
   const fullPrompt = `${prompt}\n\n--- DOCUMENT TEXT ---\n${textContent.slice(0, 12000)}`;
 
-  const response = await client.messages.create({
-    model: config.anthropic.model,
-    max_tokens: 2048,
-    messages: [{ role: 'user', content: fullPrompt }],
+  const response = await fetch(OPENROUTER_API_URL, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'Authorization': `Bearer ${apiKey}`,
+    },
+    body: JSON.stringify({
+      model: MODEL,
+      max_tokens: 2048,
+      messages: [{ role: 'user', content: fullPrompt }],
+      response_format: { type: 'json_object' },
+    }),
   });
 
-  const raw = response.content.find((b) => b.type === 'text')?.text ?? '{}';
+  if (!response.ok) {
+    const err = await response.text();
+    throw new Error(`OpenRouter error: ${response.status} ${err}`);
+  }
+
+  const data = await response.json() as { choices: { message: { content: string } }[], usage: { prompt_tokens: number; completion_tokens: number } };
+  const raw = data.choices[0].message.content ?? '{}';
+
   let parsed: Record<string, unknown>;
   try {
     parsed = JSON.parse(raw.replace(/```json|```/g, '').trim());
@@ -141,7 +157,7 @@ export async function extractDocument(req: ExtractRequest): Promise<ExtractRespo
   return {
     id,
     status: 'success',
-    model: config.anthropic.model,
+    model: MODEL,
     document_type: detectedType,
     page_count: pageCount,
     word_count: wordCount,
@@ -149,7 +165,7 @@ export async function extractDocument(req: ExtractRequest): Promise<ExtractRespo
     summary: parsed.summary as string | undefined,
     ...(req.output_format === 'raw' && { raw_text: textContent }),
     latency_ms: Date.now() - t0,
-    usage: { input_tokens: response.usage.input_tokens, output_tokens: response.usage.output_tokens },
+    usage: { input_tokens: data.usage.prompt_tokens, output_tokens: data.usage.completion_tokens },
     created_at: new Date().toISOString(),
   };
 }
