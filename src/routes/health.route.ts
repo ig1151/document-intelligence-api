@@ -1,5 +1,4 @@
 import { Router, Request, Response } from 'express';
-import { config } from '../utils/config';
 export const healthRouter = Router();
 const startTime = Date.now();
 healthRouter.get('/', (_req: Request, res: Response) => {
